@@ -6,6 +6,7 @@ Contains all hyperparameters, paths, and global settings
 import os
 from dataclasses import dataclass, asdict
 from typing import List, Dict, Any
+from pathlib import Path
 import json
 import torch
 
@@ -99,6 +100,16 @@ class ExperimentConfig:
             self.g_hidden_dims = [32, 64, 128]
         if self.d_hidden_dims is None:
             self.d_hidden_dims = [128, 64, 32]
+
+        # Convert directory paths to Path objects
+        self.output_dir = Path(self.output_dir)
+        self.models_dir = Path(self.models_dir)
+        self.figures_dir = Path(self.figures_dir)
+        self.results_dir = Path(self.results_dir)
+        self.cache_dir = Path(self.cache_dir)
+
+        # Set outputs_dir as alias for output_dir (backward compatibility)
+        self.outputs_dir = self.output_dir
 
         # Create directories
         for dir_path in [

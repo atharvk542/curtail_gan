@@ -8,8 +8,8 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
-from typing import Dict, Tuple, Optional, List
-import warnings
+from typing import Dict, Tuple, List
+from tqdm import tqdm
 
 from config import CONFIG
 from utils import compute_rarity_scores_correct
@@ -151,20 +151,22 @@ def compute_per_sample_gradients(
 
 
 def train_baseline_gan(
-    data_train: np.ndarray,
-    data_val: np.ndarray,
-    sorted_data: np.ndarray,
-    config: "ExperimentConfig",
+    train_data: np.ndarray,
+    val_data: np.ndarray,
+    epochs: int,
+    batch_size: int,
+    lr: float,
     seed: int,
 ) -> Tuple[Generator, Dict]:
     """
     Train baseline GAN with proper validation and early stopping.
 
     Args:
-        data_train: Training data
-        data_val: Validation data
-        sorted_data: Sorted full dataset for rarity computation
-        config: Experiment configuration
+        train_data: Training data
+        val_data: Validation data
+        epochs: Number of training epochs
+        batch_size: Batch size
+        lr: Learning rate
         seed: Random seed
 
     Returns:
@@ -174,35 +176,32 @@ def train_baseline_gan(
 
     set_seed(seed)
 
-    device = torch.device(config.device)
+    device = torch.device(CONFIG.device)
+
+    # Compute sorted data for rarity
+    sorted_data = np.sort(train_data)
 
     # Initialize models
-    G = Generator(config.latent_dim, config.g_hidden_dims).to(device)
-    D = Discriminator(config.d_hidden_dims, config.dropout_rate, use_sigmoid=True).to(
+    G = Generator(CONFIG.latent_dim, CONFIG.g_hidden_dims).to(device)
+    D = Discriminator(CONFIG.d_hidden_dims, CONFIG.dropout_rate, use_sigmoid=True).to(
         device
     )
 
-    opt_G = optim.Adam(
-        G.parameters(), lr=config.learning_rate, betas=(config.beta1, config.beta2)
-    )
-    opt_D = optim.Adam(
-        D.parameters(), lr=config.learning_rate, betas=(config.beta1, config.beta2)
-    )
+    opt_G = optim.Adam(G.parameters(), lr=lr, betas=(CONFIG.beta1, CONFIG.beta2))
+    opt_D = optim.Adam(D.parameters(), lr=lr, betas=(CONFIG.beta1, CONFIG.beta2))
 
     # FIX Issue 32: Learning rate scheduler
-    if config.use_lr_scheduler:
-        if config.lr_scheduler_type == "cosine":
-            sched_G = optim.lr_scheduler.CosineAnnealingLR(opt_G, T_max=config.epochs)
-            sched_D = optim.lr_scheduler.CosineAnnealingLR(opt_D, T_max=config.epochs)
+    if CONFIG.use_lr_scheduler:
+        if CONFIG.lr_scheduler_type == "cosine":
+            sched_G = optim.lr_scheduler.CosineAnnealingLR(opt_G, T_max=epochs)
+            sched_D = optim.lr_scheduler.CosineAnnealingLR(opt_D, T_max=epochs)
         else:
             sched_G = sched_D = None
     else:
         sched_G = sched_D = None
 
     # Prepare data
-    train_loader = prepare_dataloader(
-        data_train, config.batch_size, device, shuffle=True
-    )
+    train_loader = prepare_dataloader(train_data, batch_size, device, shuffle=True)
 
     history = {
         "train_loss_d": [],
@@ -215,7 +214,7 @@ def train_baseline_gan(
     best_val_metric = float("inf")
     patience_counter = 0
 
-    for epoch in range(config.epochs):
+    for epoch in tqdm(range(epochs), desc="Baseline GAN", leave=False):
         G.train()
         D.train()
 
@@ -230,7 +229,7 @@ def train_baseline_gan(
             # === Train Discriminator ===
             opt_D.zero_grad()
 
-            z = torch.randn(bs, config.latent_dim, device=device)
+            z = torch.randn(bs, CONFIG.latent_dim, device=device)
             fake = G(z)
 
             real_pred = D(real)
@@ -249,7 +248,7 @@ def train_baseline_gan(
             # === Train Generator ===
             opt_G.zero_grad()
 
-            z = torch.randn(bs, config.latent_dim, device=device)
+            z = torch.randn(bs, CONFIG.latent_dim, device=device)
             fake = G(z)
             fake_pred = D(fake)
 
@@ -289,13 +288,13 @@ def train_baseline_gan(
         if epoch % 10 == 0:
             G.eval()
             with torch.no_grad():
-                z_val = torch.randn(len(data_val), config.latent_dim, device=device)
+                z_val = torch.randn(len(val_data), CONFIG.latent_dim, device=device)
                 gen_val = G(z_val).cpu().numpy().flatten()
 
             from metrics import compute_tail_metrics
 
             val_metrics = compute_tail_metrics(
-                data_val, gen_val, config.tail_threshold_q
+                val_data, gen_val, CONFIG.tail_threshold_q
             )
             history["val_metrics"].append(val_metrics)
 
@@ -308,8 +307,8 @@ def train_baseline_gan(
                 patience_counter += 1
 
             if (
-                config.use_early_stopping
-                and patience_counter >= config.early_stop_patience // 10
+                CONFIG.use_early_stopping
+                and patience_counter >= CONFIG.early_stop_patience // 10
             ):
                 print(f"Early stopping at epoch {epoch}")
                 break
@@ -318,12 +317,15 @@ def train_baseline_gan(
 
 
 def train_curritail_gan(
-    data_train: np.ndarray,
-    data_val: np.ndarray,
-    sorted_data: np.ndarray,
-    config: "ExperimentConfig",
+    train_data: np.ndarray,
+    val_data: np.ndarray,
+    epochs: int,
+    batch_size: int,
+    alpha: float,
+    k: float,
+    schedule: str,
+    lr: float,
     seed: int,
-    schedule: str = "sigmoid",
 ) -> Tuple[Generator, Dict]:
     """
     Train CurriTail-GAN with curriculum learning.
@@ -331,12 +333,15 @@ def train_curritail_gan(
     FIX Issue 22: Uses precomputed quantile bins for efficiency.
 
     Args:
-        data_train: Training data
-        data_val: Validation data
-        sorted_data: Sorted full dataset
-        config: Experiment configuration
-        seed: Random seed
+        train_data: Training data
+        val_data: Validation data
+        epochs: Number of training epochs
+        batch_size: Batch size
+        alpha: Curriculum strength parameter
+        k: Curriculum steepness parameter
         schedule: Curriculum schedule type
+        lr: Learning rate
+        seed: Random seed
 
     Returns:
         Tuple of (trained generator, history dict)
@@ -345,29 +350,26 @@ def train_curritail_gan(
 
     set_seed(seed)
 
-    device = torch.device(config.device)
+    device = torch.device(CONFIG.device)
 
-    G = Generator(config.latent_dim, config.g_hidden_dims).to(device)
-    D = Discriminator(config.d_hidden_dims, config.dropout_rate, use_sigmoid=True).to(
+    # Compute sorted data for rarity
+    sorted_data = np.sort(train_data)
+
+    G = Generator(CONFIG.latent_dim, CONFIG.g_hidden_dims).to(device)
+    D = Discriminator(CONFIG.d_hidden_dims, CONFIG.dropout_rate, use_sigmoid=True).to(
         device
     )
 
-    opt_G = optim.Adam(
-        G.parameters(), lr=config.learning_rate, betas=(config.beta1, config.beta2)
-    )
-    opt_D = optim.Adam(
-        D.parameters(), lr=config.learning_rate, betas=(config.beta1, config.beta2)
-    )
+    opt_G = optim.Adam(G.parameters(), lr=lr, betas=(CONFIG.beta1, CONFIG.beta2))
+    opt_D = optim.Adam(D.parameters(), lr=lr, betas=(CONFIG.beta1, CONFIG.beta2))
 
-    if config.use_lr_scheduler and config.lr_scheduler_type == "cosine":
-        sched_G = optim.lr_scheduler.CosineAnnealingLR(opt_G, T_max=config.epochs)
-        sched_D = optim.lr_scheduler.CosineAnnealingLR(opt_D, T_max=config.epochs)
+    if CONFIG.use_lr_scheduler and CONFIG.lr_scheduler_type == "cosine":
+        sched_G = optim.lr_scheduler.CosineAnnealingLR(opt_G, T_max=epochs)
+        sched_D = optim.lr_scheduler.CosineAnnealingLR(opt_D, T_max=epochs)
     else:
         sched_G = sched_D = None
 
-    train_loader = prepare_dataloader(
-        data_train, config.batch_size, device, shuffle=True
-    )
+    train_loader = prepare_dataloader(train_data, batch_size, device, shuffle=True)
 
     history = {
         "train_loss_d": [],
@@ -381,14 +383,14 @@ def train_curritail_gan(
     best_val_metric = float("inf")
     patience_counter = 0
 
-    for epoch in range(config.epochs):
+    for epoch in tqdm(range(epochs), desc="CurriTail", leave=False):
         G.train()
         D.train()
 
         # Curriculum schedule
-        t_norm = epoch / config.epochs
+        t_norm = epoch / epochs
         if schedule == "sigmoid":
-            S_t = 1.0 / (1.0 + np.exp(-config.curriculum_k * (t_norm - 0.5)))
+            S_t = 1.0 / (1.0 + np.exp(-k * (t_norm - 0.5)))
         elif schedule == "linear":
             S_t = t_norm
         elif schedule == "step":
@@ -412,12 +414,12 @@ def train_curritail_gan(
             rarity = torch.FloatTensor(rarity_np).unsqueeze(1).to(device)
 
             # Curriculum weights
-            weights = 1.0 + config.alpha * S_t * rarity
+            weights = 1.0 + alpha * S_t * rarity
 
             # === Train Discriminator ===
             opt_D.zero_grad()
 
-            z = torch.randn(bs, config.latent_dim, device=device)
+            z = torch.randn(bs, CONFIG.latent_dim, device=device)
             fake = G(z)
 
             real_pred = D(real)
@@ -436,7 +438,7 @@ def train_curritail_gan(
             # === Train Generator ===
             opt_G.zero_grad()
 
-            z = torch.randn(bs, config.latent_dim, device=device)
+            z = torch.randn(bs, CONFIG.latent_dim, device=device)
             fake = G(z)
             fake_pred = D(fake)
 
@@ -470,13 +472,13 @@ def train_curritail_gan(
         if epoch % 10 == 0:
             G.eval()
             with torch.no_grad():
-                z_val = torch.randn(len(data_val), config.latent_dim, device=device)
+                z_val = torch.randn(len(val_data), CONFIG.latent_dim, device=device)
                 gen_val = G(z_val).cpu().numpy().flatten()
 
             from metrics import compute_tail_metrics
 
             val_metrics = compute_tail_metrics(
-                data_val, gen_val, config.tail_threshold_q
+                val_data, gen_val, CONFIG.tail_threshold_q
             )
             history["val_metrics"].append(val_metrics)
 
@@ -488,8 +490,8 @@ def train_curritail_gan(
                 patience_counter += 1
 
             if (
-                config.use_early_stopping
-                and patience_counter >= config.early_stop_patience // 10
+                CONFIG.use_early_stopping
+                and patience_counter >= CONFIG.early_stop_patience // 10
             ):
                 print(f"Early stopping at epoch {epoch}")
                 break
@@ -498,10 +500,11 @@ def train_curritail_gan(
 
 
 def train_wgan_gp(
-    data_train: np.ndarray,
-    data_val: np.ndarray,
-    sorted_data: np.ndarray,
-    config: "ExperimentConfig",
+    train_data: np.ndarray,
+    val_data: np.ndarray,
+    epochs: int,
+    batch_size: int,
+    lr: float,
     seed: int,
 ) -> Tuple[Generator, Dict]:
     """
@@ -514,27 +517,21 @@ def train_wgan_gp(
 
     set_seed(seed)
 
-    device = torch.device(config.device)
+    device = torch.device(CONFIG.device)
 
-    G = Generator(config.latent_dim, config.g_hidden_dims).to(device)
-    C = Discriminator(config.d_hidden_dims, config.dropout_rate, use_sigmoid=False).to(
+    G = Generator(CONFIG.latent_dim, CONFIG.g_hidden_dims).to(device)
+    C = Discriminator(CONFIG.d_hidden_dims, CONFIG.dropout_rate, use_sigmoid=False).to(
         device
     )  # No sigmoid for WGAN
 
-    opt_G = optim.Adam(
-        G.parameters(), lr=config.learning_rate, betas=(config.beta1, config.beta2)
-    )
-    opt_C = optim.Adam(
-        C.parameters(), lr=config.learning_rate, betas=(config.beta1, config.beta2)
-    )
+    opt_G = optim.Adam(G.parameters(), lr=lr, betas=(CONFIG.beta1, CONFIG.beta2))
+    opt_C = optim.Adam(C.parameters(), lr=lr, betas=(CONFIG.beta1, CONFIG.beta2))
 
-    train_loader = prepare_dataloader(
-        data_train, config.batch_size, device, shuffle=True
-    )
+    train_loader = prepare_dataloader(train_data, batch_size, device, shuffle=True)
 
     history = {"train_loss_c": [], "train_loss_g": [], "val_metrics": [], "epoch": []}
 
-    for epoch in range(config.epochs):
+    for epoch in tqdm(range(epochs), desc="WGAN-GP", leave=False):
         G.train()
         C.train()
 
@@ -550,10 +547,10 @@ def train_wgan_gp(
                 continue
 
             # Train Critic multiple times
-            for _ in range(config.wgan_n_critic):
+            for _ in range(CONFIG.wgan_n_critic):
                 opt_C.zero_grad()
 
-                z = torch.randn(bs, config.latent_dim, device=device)
+                z = torch.randn(bs, CONFIG.latent_dim, device=device)
                 fake = G(z)
 
                 real_pred = C(real)
@@ -577,7 +574,7 @@ def train_wgan_gp(
                 # FIX Issue 13: Keepdim to handle dimension properly
                 gp = (
                     (grads.norm(2, dim=1, keepdim=False) - 1) ** 2
-                ).mean() * config.wgan_gp_lambda
+                ).mean() * CONFIG.wgan_gp_lambda
 
                 c_loss = fake_pred.mean() - real_pred.mean() + gp
                 c_loss.backward()
@@ -587,7 +584,7 @@ def train_wgan_gp(
 
             # Train Generator
             opt_G.zero_grad()
-            z = torch.randn(bs, config.latent_dim, device=device)
+            z = torch.randn(bs, CONFIG.latent_dim, device=device)
             fake = G(z)
             g_loss = -C(fake).mean()
             g_loss.backward()
@@ -602,13 +599,13 @@ def train_wgan_gp(
         if epoch % 10 == 0:
             G.eval()
             with torch.no_grad():
-                z_val = torch.randn(len(data_val), config.latent_dim, device=device)
+                z_val = torch.randn(len(val_data), CONFIG.latent_dim, device=device)
                 gen_val = G(z_val).cpu().numpy().flatten()
 
             from metrics import compute_tail_metrics
 
             val_metrics = compute_tail_metrics(
-                data_val, gen_val, config.tail_threshold_q
+                val_data, gen_val, CONFIG.tail_threshold_q
             )
             history["val_metrics"].append(val_metrics)
 

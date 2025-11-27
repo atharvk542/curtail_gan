@@ -12,6 +12,7 @@ from pathlib import Path
 from datetime import datetime
 from typing import Dict, List
 import warnings
+from tqdm import tqdm
 
 from config import CONFIG
 from utils import set_seed, load_data_with_cache, train_val_split, verify_data_is_raw
@@ -42,6 +43,40 @@ from plotting import (
 )
 
 warnings.filterwarnings("ignore")
+
+
+def estimate_runtime() -> str:
+    """
+    Estimate total runtime based on configuration.
+    """
+    n_seeds = len(CONFIG.seeds)
+    n_datasets = len(CONFIG.datasets)
+    epochs = CONFIG.epochs
+
+    # Rough estimates (minutes per model per seed)
+    time_per_model = {
+        "baseline": epochs / 200 * 3,  # ~3 min for 200 epochs
+        "wgan": epochs / 200 * 4,  # Slower due to critic updates
+        "curritail": epochs / 200 * 3.5,
+        "tailgan": epochs / 200 * 3,
+    }
+
+    # GAN models trained on all seeds
+    gan_time = sum(time_per_model.values()) * n_seeds * n_datasets
+
+    # Expensive baselines only on first seed
+    baseline_time = 2 * n_datasets  # KDE, Bootstrap, EVT, Importance
+
+    # SPX-specific analyses
+    spx_time = 0
+    if "SPX" in CONFIG.datasets:
+        spx_time = 120  # Sensitivity + portfolio (2 hours)
+
+    total_minutes = gan_time + baseline_time + spx_time
+    hours = int(total_minutes / 60)
+    minutes = int(total_minutes % 60)
+
+    return f"{hours}h {minutes}m"
 
 
 def get_git_hash() -> str:
@@ -135,8 +170,8 @@ def train_all_models_single_seed(
         epochs=CONFIG.epochs,
         batch_size=CONFIG.batch_size,
         alpha=CONFIG.alpha,
-        k=CONFIG.k,
-        schedule=CONFIG.schedule,
+        k=CONFIG.curriculum_k,
+        schedule=CONFIG.curriculum_schedule,
         lr=CONFIG.learning_rate,
         seed=seed,
     )
@@ -174,7 +209,7 @@ def train_all_models_single_seed(
     }
 
     # Only compute expensive baselines on first seed
-    if seed == CONFIG.random_seeds[0]:
+    if seed == CONFIG.seeds[0]:
         # KDE
         print(f"    • KDE Baseline...")
         gen_kde = kde_baseline(train_data, n_samples=10000, seed=seed)
@@ -219,7 +254,7 @@ def train_all_models_single_seed(
         }
 
     # Save models
-    if CONFIG.save_models:
+    if hasattr(CONFIG, "save_models") and CONFIG.save_models:
         for model_name, model_dict in results.items():
             if model_dict["model"] is not None:
                 save_path = (
@@ -248,7 +283,7 @@ def run_ablation_study(train_data: np.ndarray, val_data: np.ndarray, seed: int) 
             epochs=CONFIG.epochs,
             batch_size=CONFIG.batch_size,
             alpha=CONFIG.alpha,
-            k=CONFIG.k,
+            k=CONFIG.curriculum_k,
             schedule=schedule,
             lr=CONFIG.learning_rate,
             seed=seed,
@@ -283,7 +318,7 @@ def run_sensitivity_analysis(
 
     for alpha in alpha_values:
         for seed_idx in range(n_seeds):
-            seed = CONFIG.random_seeds[seed_idx]
+            seed = CONFIG.seeds[seed_idx]
             set_seed(seed)
 
             G, _ = train_curritail_gan(
@@ -292,7 +327,7 @@ def run_sensitivity_analysis(
                 epochs=200,  # Faster for sensitivity
                 batch_size=CONFIG.batch_size,
                 alpha=alpha,
-                k=CONFIG.k,
+                k=CONFIG.curriculum_k,
                 schedule="sigmoid",
                 lr=CONFIG.learning_rate,
                 seed=seed,
@@ -314,7 +349,7 @@ def run_sensitivity_analysis(
 
     for k in k_values:
         for seed_idx in range(n_seeds):
-            seed = CONFIG.random_seeds[seed_idx]
+            seed = CONFIG.seeds[seed_idx]
             set_seed(seed)
 
             G, _ = train_curritail_gan(
@@ -345,7 +380,7 @@ def run_sensitivity_analysis(
 
     for bs in batch_sizes:
         for seed_idx in range(n_seeds):
-            seed = CONFIG.random_seeds[seed_idx]
+            seed = CONFIG.seeds[seed_idx]
             set_seed(seed)
 
             G, _ = train_curritail_gan(
@@ -354,7 +389,7 @@ def run_sensitivity_analysis(
                 epochs=200,
                 batch_size=bs,
                 alpha=CONFIG.alpha,
-                k=CONFIG.k,
+                k=CONFIG.curriculum_k,
                 schedule="sigmoid",
                 lr=CONFIG.learning_rate,
                 seed=seed,
@@ -382,13 +417,13 @@ def run_experiment_for_dataset(dataset_name: str) -> Dict:
 
     # Load data
     print("Loading data...")
-    raw_data = load_data_with_cache(dataset_name)
+    _, _, raw_data = load_data_with_cache(dataset_name)
 
     # Verify it's raw (not scaled)
     verify_data_is_raw(raw_data)
 
     # Split train/val
-    train_data, val_data = train_val_split(raw_data, val_ratio=CONFIG.val_ratio)
+    train_data, val_data = train_val_split(raw_data, train_ratio=CONFIG.train_ratio)
     print(f"Train size: {len(train_data)}, Val size: {len(val_data)}")
 
     # Store results across seeds
@@ -400,7 +435,7 @@ def run_experiment_for_dataset(dataset_name: str) -> Dict:
     curritail_generated_all = []
 
     # Train across all seeds
-    for seed in CONFIG.random_seeds:
+    for seed in tqdm(CONFIG.seeds, desc=f"{dataset_name} - Training Seeds"):
         print(f"\n--- Seed {seed} ---")
 
         seed_results = train_all_models_single_seed(
@@ -431,7 +466,7 @@ def run_experiment_for_dataset(dataset_name: str) -> Dict:
     # Ablation study (only first seed)
     print("\n--- Ablation Study ---")
     ablation_results = run_ablation_study(
-        train_data=train_data, val_data=val_data, seed=CONFIG.random_seeds[0]
+        train_data=train_data, val_data=val_data, seed=CONFIG.seeds[0]
     )
 
     # Sensitivity analysis (if SPX)
@@ -442,7 +477,7 @@ def run_experiment_for_dataset(dataset_name: str) -> Dict:
             train_data=train_data,
             val_data=val_data,
             real_data=raw_data,
-            n_seeds=min(5, len(CONFIG.random_seeds)),
+            n_seeds=min(5, len(CONFIG.seeds)),
         )
 
     # Portfolio analysis (if SPX)
@@ -700,8 +735,12 @@ def main():
 
     print(f"\nGit Hash: {metadata['git_hash']}")
     print(f"Device: {CONFIG.device}")
-    print(f"Seeds: {CONFIG.random_seeds}")
+    print(f"Seeds: {CONFIG.seeds[:3]}...{CONFIG.seeds[-1]} ({len(CONFIG.seeds)} total)")
     print(f"Datasets: {CONFIG.datasets}")
+    print(f"Epochs: {CONFIG.epochs}")
+    print(f"Batch Size: {CONFIG.batch_size}")
+    print(f"\n⏱️  Estimated Runtime: {estimate_runtime()}")
+    print(f"{'=' * 80}\n")
 
     # Run experiments
     experiment_results = {}

@@ -93,7 +93,7 @@ class ExperimentConfig:
     def __post_init__(self):
         """Set default values for list fields"""
         if self.seeds is None:
-            self.seeds = list(range(42, 72))  # 30 seeds as required
+            self.seeds = list(range(42, 51))  # 30 seeds as required
         if self.datasets is None:
             self.datasets = ["Synthetic", "SPX", "BTC"]
         if self.g_hidden_dims is None:

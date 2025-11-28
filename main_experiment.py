@@ -500,7 +500,7 @@ def run_experiment_for_dataset(dataset_name: str) -> Dict:
     df_results = pd.DataFrame(all_seed_results)
 
     statistical_comparisons = compare_all_models(
-        df_results, reference_model="curritail", metric="tail_kl"
+        df_results, reference_model="curritail"
     )
 
     # Validate against paper if SPX
